@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cuda_runtime.h>
+#include <exception>
 #include "allocator.h"
 #include "kv_config.h"
 
