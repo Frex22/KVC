@@ -39,7 +39,7 @@
 			{
 				"command" : 2,
 				"file" : 0,
-				"line" : 37,
+				"line" : 35,
 				"parent" : 0
 			},
 			{
@@ -56,7 +56,7 @@
 			"compileCommandFragments" : 
 			[
 				{
-					"fragment" : "-O3 -DNDEBUG -std=c++17 \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\""
+					"fragment" : "-g -std=c++17 \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\""
 				},
 				{
 					"backtrace" : 2,
@@ -67,7 +67,7 @@
 			[
 				{
 					"backtrace" : 3,
-					"define" : "KV_DEBUG=0"
+					"define" : "KV_DEBUG=1"
 				}
 			],
 			"includes" : 
@@ -99,7 +99,7 @@
 		"commandFragments" : 
 		[
 			{
-				"fragment" : "-O3 -DNDEBUG \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\"",
+				"fragment" : "-g \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\"",
 				"role" : "flags"
 			},
 			{

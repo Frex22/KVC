@@ -1,13 +1,13 @@
 [
 {
   "directory": "/home/aakash32/kv_paged_cache/build",
-  "command": "/usr/bin/nvcc -forward-unknown-to-host-compiler -DKV_DEBUG=0 --options-file CMakeFiles/kv_paged_cache.dir/includes_CUDA.rsp -O3 -DNDEBUG -std=c++17 \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\" -lineinfo -x cu -rdc=true -c /home/aakash32/kv_paged_cache/src/main.cu -o CMakeFiles/kv_paged_cache.dir/src/main.cu.o",
+  "command": "/usr/bin/nvcc -forward-unknown-to-host-compiler -DKV_DEBUG=1 --options-file CMakeFiles/kv_paged_cache.dir/includes_CUDA.rsp -g -std=c++17 \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\" -lineinfo -x cu -rdc=true -c /home/aakash32/kv_paged_cache/src/main.cu -o CMakeFiles/kv_paged_cache.dir/src/main.cu.o",
   "file": "/home/aakash32/kv_paged_cache/src/main.cu",
   "output": "CMakeFiles/kv_paged_cache.dir/src/main.cu.o"
 },
 {
   "directory": "/home/aakash32/kv_paged_cache/build",
-  "command": "/usr/bin/nvcc -forward-unknown-to-host-compiler -DKV_DEBUG=0 --options-file CMakeFiles/kv_paged_cache.dir/includes_CUDA.rsp -O3 -DNDEBUG -std=c++17 \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\" -lineinfo -x cu -rdc=true -c /home/aakash32/kv_paged_cache/src/allocator.cu -o CMakeFiles/kv_paged_cache.dir/src/allocator.cu.o",
+  "command": "/usr/bin/nvcc -forward-unknown-to-host-compiler -DKV_DEBUG=1 --options-file CMakeFiles/kv_paged_cache.dir/includes_CUDA.rsp -g -std=c++17 \"--generate-code=arch=compute_52,code=[compute_52,sm_52]\" -lineinfo -x cu -rdc=true -c /home/aakash32/kv_paged_cache/src/allocator.cu -o CMakeFiles/kv_paged_cache.dir/src/allocator.cu.o",
   "file": "/home/aakash32/kv_paged_cache/src/allocator.cu",
   "output": "CMakeFiles/kv_paged_cache.dir/src/allocator.cu.o"
 }

@@ -6,7 +6,7 @@
 			[
 				{
 					"build" : ".",
-					"jsonFile" : "directory-.-Release-f5ebdc15457944623624.json",
+					"jsonFile" : "directory-.-Debug-f5ebdc15457944623624.json",
 					"minimumCMakeVersion" : 
 					{
 						"string" : "3.24"
@@ -19,7 +19,7 @@
 					]
 				}
 			],
-			"name" : "Release",
+			"name" : "Debug",
 			"projects" : 
 			[
 				{
@@ -39,7 +39,7 @@
 				{
 					"directoryIndex" : 0,
 					"id" : "kv_paged_cache::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-kv_paged_cache-Release-6fcd89f08cf3792723c7.json",
+					"jsonFile" : "target-kv_paged_cache-Debug-b860906fd2dc0538ff24.json",
 					"name" : "kv_paged_cache",
 					"projectIndex" : 0
 				}

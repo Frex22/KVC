@@ -19,6 +19,14 @@ __global__ void sanity_kernel(int32_t* top, uint32_t* free_count, uint32_t num_b
   }
 }
 
+__global__ void init_free_stack_kernel(uint32_t* free_stack, uint32_t num_blocks) {
+  uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num_blocks) {
+    free_stack[idx] = num_blocks - 1u - idx; // LIFO order
+  }
+}
+
+
 void init_system(AllocatorSystem& sys) {
   // Compute block counts from pool_bytes
   const std::size_t bytes_per_block = bytes_per_block_k_plus_v();
@@ -63,6 +71,13 @@ void init_system(AllocatorSystem& sys) {
   checkCuda(cudaMalloc(&sys.seq_len, sizeof(std::uint32_t) * sys.cfg.batch_size), "cudaMalloc seq_len");
   checkCuda(cudaMemset(sys.seq_len, 0, sizeof(std::uint32_t) * sys.cfg.batch_size), "cudaMemset seq_len=0");
 
+  // Initialize free stack contents
+  const int threads = 256;
+  const int blocks = (num_blocks + threads -1) / threads;
+  init_free_stack_kernel<<<blocks, threads>>>(sys.alloc.free_stack, num_blocks);
+  checkCuda(cudaGetLastError(), "launch init_free_stack_kernel");
+  checkCuda(cudaDeviceSynchronize(), "sync init_free_stack_kernel");
+
   // NOTE: We will initialize free_stack contents in the next step.
   // For now, just run sanity kernel to set top/free_count.
   sanity_kernel<<<1, 32>>>(sys.alloc.top, sys.alloc.free_count, num_blocks);
@@ -106,7 +121,22 @@ void run_sanity(AllocatorSystem& sys) {
   }
   if (h_free_count != 0) {
     throw std::runtime_error("sanity failed: free_count != 0");
+  
   }
+    // Verify free_stack first/last few entries
+  uint32_t first8[8]{}, last8[8]{};
+  checkCuda(cudaMemcpy(first8, sys.alloc.free_stack, sizeof(first8), cudaMemcpyDeviceToHost),
+            "memcpy free_stack first8");
+  checkCuda(cudaMemcpy(last8, sys.alloc.free_stack + (sys.pool.num_blocks - 8), sizeof(last8), cudaMemcpyDeviceToHost),
+            "memcpy free_stack last8");
+
+  std::printf("[sanity] free_stack first8: ");
+  for (auto v : first8) std::printf("%u ", v);
+  std::printf("\n");
+
+  std::printf("[sanity] free_stack last8: ");
+  for (auto v : last8) std::printf("%u ", v);
+  std::printf("\n");
 }
 
 } // namespace kv
