@@ -13,29 +13,138 @@ void checkCuda(cudaError_t e, const char* what) {
 
 __global__ void sanity_kernel(int32_t* top, uint32_t* free_count, uint32_t num_blocks) {
   if (threadIdx.x == 0 && blockIdx.x == 0) {
-    // Set expected initial values (we'll verify on host)
     *top = static_cast<int32_t>(num_blocks);
     *free_count = 0;
   }
 }
 
 __global__ void init_free_stack_kernel(uint32_t* free_stack, uint32_t num_blocks) {
-  uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_blocks) {
-    free_stack[idx] = num_blocks - 1u - idx; // LIFO order
+  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < num_blocks) {
+    // Order B: descending
+    free_stack[i] = (num_blocks - 1u - i);
   }
 }
 
+__device__ __forceinline__ unsigned lane_id() {
+  unsigned id;
+  asm("mov.u32 %0, %laneid;" : "=r"(id));
+  return id;
+}
+
+// One warp per request allocator
+__global__ void alloc_blocks_kernel(
+    uint32_t* block_table,
+    uint32_t max_blocks_per_seq,
+    uint32_t* seq_block_cursor,
+    const uint32_t* req_new_blocks,
+    uint32_t* alloc_failed,
+    uint32_t* free_stack,
+    int32_t* top,
+#if KV_DEBUG
+    int32_t* owner,
+#endif
+    uint32_t num_blocks,
+    uint32_t batch_size)
+{
+  const uint32_t global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t warp_global = global_thread / 32;
+  const uint32_t b = warp_global;
+
+  if (b >= batch_size) return;
+
+  const uint32_t lane = lane_id();
+
+  // If already failed, do nothing
+  if (alloc_failed[b]) return;
+
+  const uint32_t k = req_new_blocks[b];
+  if (k == 0) return;
+
+  // Per-warp shared state (indexed by warp-in-block)
+  const uint32_t warp_in_block = threadIdx.x / 32;
+  //const uint32_t warps_per_block = blockDim.x / 32;
+
+  // v0: we expect small warps_per_block (e.g., 4). Keep shared arrays size 8.
+  __shared__ int32_t  s_old_top_w[8];
+  __shared__ int32_t  s_new_top_w[8];
+  __shared__ uint32_t s_fail_w[8];
+
+  if (warp_in_block >= 8) return; // safety if someone changes blockDim later
+
+  // Reserve k blocks from stack via CAS loop (lane 0 of warp)
+  if (lane == 0) {
+    s_fail_w[warp_in_block] = 0;
+
+    while (true) {
+      int32_t old = *top;
+
+      if (old < static_cast<int32_t>(k)) {
+        s_fail_w[warp_in_block] = 1;
+        s_old_top_w[warp_in_block] = old;
+        s_new_top_w[warp_in_block] = old;
+        break;
+      }
+
+      int32_t desired = old - static_cast<int32_t>(k);
+      int32_t prev = atomicCAS(top, old, desired);
+
+      if (prev == old) {
+        // Success: reserved k blocks.
+        s_old_top_w[warp_in_block] = old;
+        s_new_top_w[warp_in_block] = desired;
+        break;
+      }
+      // else retry
+    }
+  }
+
+  __syncwarp();
+
+  if (s_fail_w[warp_in_block]) {
+    if (lane == 0) alloc_failed[b] = 1;
+    return;
+  }
+
+  const int32_t old_top = s_old_top_w[warp_in_block];
+  const int32_t new_top = s_new_top_w[warp_in_block];
+  // Popped indices: [new_top .. old_top-1]
+
+  const uint32_t cursor = seq_block_cursor[b];
+
+  // Bounds check: ensure we don't exceed max blocks for the seq
+  if (cursor + k > max_blocks_per_seq) {
+    if (lane == 0) alloc_failed[b] = 1;
+    // NOTE: in v0 we don't rollback reserved blocks; treat as caller bug.
+    return;
+  }
+
+  // Cooperative write of k block IDs into block table
+  for (uint32_t i = lane; i < k; i += 32) {
+    const uint32_t stack_idx = static_cast<uint32_t>(new_top + static_cast<int32_t>(i));
+    // stack_idx must be < num_blocks; ensured by top logic
+    const uint32_t p = free_stack[stack_idx];
+
+    block_table[b * max_blocks_per_seq + (cursor + i)] = p;
+
+#if KV_DEBUG
+    // Debug ownership: claim owner[p] = b if it was -1
+    int32_t prev_owner = atomicCAS(&owner[p], -1, static_cast<int32_t>(b));
+    (void)prev_owner; // if prev_owner != -1 => duplicate allocation bug
+#endif
+  }
+
+  if (lane == 0) {
+    seq_block_cursor[b] = cursor + k;
+  }
+}
 
 void init_system(AllocatorSystem& sys) {
-  // Compute block counts from pool_bytes
   const std::size_t bytes_per_block = bytes_per_block_k_plus_v();
   if (bytes_per_block == 0) throw std::runtime_error("bytes_per_block is zero");
 
-  // How many physical blocks fit
   const std::uint32_t num_blocks =
       static_cast<std::uint32_t>(sys.cfg.pool_bytes / bytes_per_block);
-
   if (num_blocks == 0) throw std::runtime_error("pool too small for even one block");
 
   sys.pool.num_blocks = num_blocks;
@@ -50,7 +159,7 @@ void init_system(AllocatorSystem& sys) {
   checkCuda(cudaMalloc(&sys.alloc.top, sizeof(std::int32_t)), "cudaMalloc top");
   checkCuda(cudaMalloc(&sys.alloc.free_count, sizeof(std::uint32_t)), "cudaMalloc free_count");
 
-  // Free queue capacity: at most all blocks (simple v0)
+  // Deferred free queue (v0: capacity = num_blocks)
   sys.alloc.free_queue_cap = num_blocks;
   checkCuda(cudaMalloc(&sys.alloc.free_queue, sizeof(std::uint32_t) * sys.alloc.free_queue_cap), "cudaMalloc free_queue");
 
@@ -71,18 +180,21 @@ void init_system(AllocatorSystem& sys) {
   checkCuda(cudaMalloc(&sys.seq_len, sizeof(std::uint32_t) * sys.cfg.batch_size), "cudaMalloc seq_len");
   checkCuda(cudaMemset(sys.seq_len, 0, sizeof(std::uint32_t) * sys.cfg.batch_size), "cudaMemset seq_len=0");
 
-  // Initialize free stack contents
-  const int threads = 256;
-  const int blocks = (num_blocks + threads -1) / threads;
-  init_free_stack_kernel<<<blocks, threads>>>(sys.alloc.free_stack, num_blocks);
-  checkCuda(cudaGetLastError(), "launch init_free_stack_kernel");
-  checkCuda(cudaDeviceSynchronize(), "sync init_free_stack_kernel");
+  // Alloc failure flags (persist once set)
+  checkCuda(cudaMalloc(&sys.alloc_failed, sizeof(std::uint32_t) * sys.cfg.batch_size), "cudaMalloc alloc_failed");
+  checkCuda(cudaMemset(sys.alloc_failed, 0, sizeof(std::uint32_t) * sys.cfg.batch_size), "cudaMemset alloc_failed=0");
 
-  // NOTE: We will initialize free_stack contents in the next step.
-  // For now, just run sanity kernel to set top/free_count.
+  // Set top and free_count
   sanity_kernel<<<1, 32>>>(sys.alloc.top, sys.alloc.free_count, num_blocks);
   checkCuda(cudaGetLastError(), "launch sanity_kernel");
   checkCuda(cudaDeviceSynchronize(), "sync sanity_kernel");
+
+  // Initialize free_stack
+  const int threads = 256;
+  const int blocks = (num_blocks + threads - 1) / threads;
+  init_free_stack_kernel<<<blocks, threads>>>(sys.alloc.free_stack, num_blocks);
+  checkCuda(cudaGetLastError(), "launch init_free_stack_kernel");
+  checkCuda(cudaDeviceSynchronize(), "sync init_free_stack_kernel");
 }
 
 void destroy_system(AllocatorSystem& sys) {
@@ -102,6 +214,7 @@ void destroy_system(AllocatorSystem& sys) {
   free_if(sys.block_table);
   free_if(sys.seq_block_cursor);
   free_if(sys.seq_len);
+  free_if(sys.alloc_failed);
 
   sys = AllocatorSystem{};
 }
@@ -121,9 +234,9 @@ void run_sanity(AllocatorSystem& sys) {
   }
   if (h_free_count != 0) {
     throw std::runtime_error("sanity failed: free_count != 0");
-  
   }
-    // Verify free_stack first/last few entries
+
+  // Verify free_stack first/last few entries
   uint32_t first8[8]{}, last8[8]{};
   checkCuda(cudaMemcpy(first8, sys.alloc.free_stack, sizeof(first8), cudaMemcpyDeviceToHost),
             "memcpy free_stack first8");
@@ -137,6 +250,66 @@ void run_sanity(AllocatorSystem& sys) {
   std::printf("[sanity] free_stack last8: ");
   for (auto v : last8) std::printf("%u ", v);
   std::printf("\n");
+}
+
+void test_alloc_step(AllocatorSystem& sys) {
+  const uint32_t B = sys.cfg.batch_size;
+  const uint32_t M = max_blocks_per_seq(sys.cfg.max_seq_len);
+
+  // Prefill-style: allocate 2 blocks per request (batch=8 in v0)
+  uint32_t h_req[8] = {2,2,2,2,2,2,2,2};
+
+  uint32_t* d_req = nullptr;
+  checkCuda(cudaMalloc(&d_req, sizeof(uint32_t) * B), "cudaMalloc d_req");
+  checkCuda(cudaMemcpy(d_req, h_req, sizeof(uint32_t) * B, cudaMemcpyHostToDevice), "memcpy req H2D");
+
+  // Launch enough warps to cover B requests
+  const int threads = 128; // 4 warps per block
+  const int total_threads = static_cast<int>(B) * 32;
+  const int blocks = (total_threads + threads - 1) / threads;
+
+  alloc_blocks_kernel<<<blocks, threads>>>(
+      sys.block_table,
+      M,
+      sys.seq_block_cursor,
+      d_req,
+      sys.alloc_failed,
+      sys.alloc.free_stack,
+      sys.alloc.top,
+#if KV_DEBUG
+      sys.alloc.owner,
+#endif
+      sys.pool.num_blocks,
+      B
+  );
+  checkCuda(cudaGetLastError(), "launch alloc_blocks_kernel");
+  checkCuda(cudaDeviceSynchronize(), "sync alloc_blocks_kernel");
+
+  // Read back cursors + top + failed
+  uint32_t h_cursor[8]{};
+  uint32_t h_failed[8]{};
+  int32_t h_top = -1;
+
+  checkCuda(cudaMemcpy(h_cursor, sys.seq_block_cursor, sizeof(h_cursor), cudaMemcpyDeviceToHost), "memcpy cursor D2H");
+  checkCuda(cudaMemcpy(h_failed, sys.alloc_failed, sizeof(h_failed), cudaMemcpyDeviceToHost), "memcpy failed D2H");
+  checkCuda(cudaMemcpy(&h_top, sys.alloc.top, sizeof(h_top), cudaMemcpyDeviceToHost), "memcpy top D2H");
+
+  std::printf("[alloc-test] top=%d (expected %d)\n", h_top,
+              static_cast<int>(sys.pool.num_blocks) - static_cast<int>(B * 2));
+
+  for (uint32_t b = 0; b < B; ++b) {
+    std::printf("[alloc-test] b=%u cursor=%u failed=%u\n", b, h_cursor[b], h_failed[b]);
+  }
+
+  // Optionally inspect first few block_table entries for request 0
+  uint32_t h_bt0[8]{};
+  checkCuda(cudaMemcpy(h_bt0, sys.block_table + 0 * M, sizeof(h_bt0), cudaMemcpyDeviceToHost),
+            "memcpy block_table[0] first8");
+  std::printf("[alloc-test] block_table[0] first8: ");
+  for (auto v : h_bt0) std::printf("%u ", v);
+  std::printf("\n");
+
+  checkCuda(cudaFree(d_req), "cudaFree d_req");
 }
 
 } // namespace kv

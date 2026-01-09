@@ -47,6 +47,11 @@ struct AllocatorSystem {
 
   // Optional: seq_len (tokens) if you want it early
   std::uint32_t* seq_len = nullptr;
+    // Per-sequence alloc failure flag (persist once set)
+  std::uint32_t* alloc_failed = nullptr;
+
+  void test_alloc_step(AllocatorSystem& sys);
+
 };
 
 void checkCuda(cudaError_t e, const char* what);
@@ -56,5 +61,7 @@ void destroy_system(AllocatorSystem& sys);
 
 // Tiny sanity kernel to validate we can touch device scalars
 void run_sanity(AllocatorSystem& sys);
+void test_alloc_step(AllocatorSystem& sys);
+
 
 } // namespace kv
