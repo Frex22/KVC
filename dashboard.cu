@@ -105,3 +105,5 @@ __global__ void alloc_blocks_kernel(
     seq_block_cursor[b] = cursor + k;
   }
 }
+
+

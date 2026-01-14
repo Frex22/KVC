@@ -139,6 +139,105 @@ __global__ void alloc_blocks_kernel(
   }
 }
 
+__global__ void end_sequence_enqueue_kernel(
+    uint32_t* block_table,
+    uint32_t max_blocks_per_seq,
+    uint32_t* seq_block_cursor,
+    uint32_t* alloc_failed,
+    uint32_t* free_queue,
+    uint32_t* free_count,
+#if KV_DEBUG
+    int32_t* owner,
+#endif
+    uint32_t batch_size) 
+    {
+      const uint32_t global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+      const uint32_t warp_global = global_thread / 32;
+      const uint32_t b = warp_global;
+      if (b >= batch_size) return;
+      const uint32_t lane = lane_id();
+
+      // If sequence already failed, treat as ended
+      const uint32_t n = seq_block_cursor[b];
+      if (n == 0) {
+        if (lane == 0){
+          seq_block_cursor[b] = 0;
+          alloc_failed[b] = 0;
+        }
+        return;
+
+      }
+
+      // Enqueue blocks back to free_queue
+      for(uint32_t i = lane; i < n; i += 32) 
+      {
+        uint32_t p = block_table[b*max_blocks_per_seq + i];
+        // Append p to free_queue
+        if (p != 0xFFFFFFFF) {
+          // valid block
+        uint32_t idx = atomicAdd(free_count, 1u);
+        free_queue[idx] = p;
+#if KV_DEBUG
+        // Debug ownership: release owner[p] = -1
+        owner[p] = -1;
+#endif
+        block_table[b*max_blocks_per_seq + i] = 0xFFFFFFFF; // optional clear
+ 
+
+      }
+
+    }
+
+    __syncwarp();
+
+    if (lane == 0) {
+      seq_block_cursor[b] = 0;
+      alloc_failed[b] = 0;
+
+    }
+
+  }
+
+__global__ void sweep_kernel (
+  uint32_t* free_stack,
+  int32_t* top,
+  uint32_t* free_queue,
+  uint32_t* free_count,
+  uint32_t num_blocks)
+
+  {
+    __shared__ uint32_t s_n;
+    __shared__ int32_t s_old_top;
+
+    if (threadIdx.x == 0) {
+      s_n = *free_count;
+      s_old_top = 0;
+      if (s_n > 0) {
+        //reserve space in free_stack
+        s_old_top = atomicAdd(top, static_cast<int32_t>(s_n));
+        //reset free_count
+        *free_count = 0;
+      }
+    }
+
+    __syncthreads();
+
+     const uint32_t n = s_n;
+  if (n == 0) return;
+
+  // Bounds safety: old_top + n must not exceed num_blocks
+  // (We assume correct usage in v0; later add hard checks.)
+
+  // Copy freed IDs back into stack
+  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  for (; i < n; i += blockDim.x * gridDim.x) {
+    free_stack[static_cast<uint32_t>(s_old_top) + i] = free_queue[i];
+  }
+
+
+  }
+
+
 void init_system(AllocatorSystem& sys) {
   const std::size_t bytes_per_block = bytes_per_block_k_plus_v();
   if (bytes_per_block == 0) throw std::runtime_error("bytes_per_block is zero");
@@ -310,6 +409,70 @@ void test_alloc_step(AllocatorSystem& sys) {
   std::printf("\n");
 
   checkCuda(cudaFree(d_req), "cudaFree d_req");
+}
+
+void test_free_sweep_reuse(AllocatorSystem& sys) {
+  const uint32_t B = sys.cfg.batch_size;
+  const uint32_t M = max_blocks_per_seq(sys.cfg.max_seq_len);
+
+  // 1) Allocate 2 blocks per request (reuse your existing test pattern)
+  std::printf("\n[reuse-test] allocate phase\n");
+  test_alloc_step(sys);
+
+  // 2) End all sequences: enqueue their blocks into free_queue
+  std::printf("[reuse-test] end-sequence enqueue\n");
+  {
+    const int threads = 128; // 4 warps/block
+    const int total_threads = static_cast<int>(B) * 32;
+    const int blocks = (total_threads + threads - 1) / threads;
+
+    end_sequence_enqueue_kernel<<<blocks, threads>>>(
+        sys.block_table,
+        M,
+        sys.seq_block_cursor,
+        sys.alloc_failed,
+        sys.alloc.free_queue,
+        sys.alloc.free_count,
+#if KV_DEBUG
+        sys.alloc.owner,
+#endif
+        B
+    );
+    checkCuda(cudaGetLastError(), "launch end_sequence_enqueue_kernel");
+    checkCuda(cudaDeviceSynchronize(), "sync end_sequence_enqueue_kernel");
+  }
+
+  // Read free_count
+  uint32_t h_free_count = 0;
+  checkCuda(cudaMemcpy(&h_free_count, sys.alloc.free_count, sizeof(h_free_count), cudaMemcpyDeviceToHost),
+            "memcpy free_count D2H");
+  std::printf("[reuse-test] free_count after enqueue = %u (expected %u)\n", h_free_count, B * 2);
+
+  // 3) Sweep: move free_queue back into free_stack and restore top
+  std::printf("[reuse-test] sweep\n");
+  {
+    // A simple sweep launch (enough threads to copy n entries)
+    const int threads = 256;
+    const int blocks = 4;
+    sweep_kernel<<<blocks, threads>>>(
+        sys.alloc.free_stack,
+        sys.alloc.top,
+        sys.alloc.free_queue,
+        sys.alloc.free_count,
+        sys.pool.num_blocks
+    );
+    checkCuda(cudaGetLastError(), "launch sweep_kernel");
+    checkCuda(cudaDeviceSynchronize(), "sync sweep_kernel");
+  }
+
+  int32_t h_top = -1;
+  checkCuda(cudaMemcpy(&h_top, sys.alloc.top, sizeof(h_top), cudaMemcpyDeviceToHost), "memcpy top D2H");
+  std::printf("[reuse-test] top after sweep = %d (expected %u)\n", h_top, sys.pool.num_blocks);
+
+  // 4) Allocate again and see if top decreases again (proves reuse)
+  std::printf("[reuse-test] allocate again\n");
+  test_alloc_step(sys);
+  std::printf("[reuse-test] done\n\n");
 }
 
 } // namespace kv

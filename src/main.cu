@@ -34,6 +34,9 @@ int main() {
     kv::init_system(sys);
     kv::run_sanity(sys);
     kv::test_alloc_step(sys);
+    kv::run_sanity(sys);
+    kv::test_free_sweep_reuse(sys);
+
 
     kv::destroy_system(sys);
     std::printf("Done.\n");

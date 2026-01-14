@@ -62,6 +62,8 @@ void destroy_system(AllocatorSystem& sys);
 // Tiny sanity kernel to validate we can touch device scalars
 void run_sanity(AllocatorSystem& sys);
 void test_alloc_step(AllocatorSystem& sys);
+void test_free_sweep_reuse(AllocatorSystem& sys);
+
 
 
 } // namespace kv
