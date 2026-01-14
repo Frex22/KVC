@@ -198,7 +198,7 @@ __global__ void end_sequence_enqueue_kernel(
 
   }
 
-__global__ void sweep_kernel (
+/*__global__ void sweep_kernel (
   uint32_t* free_stack,
   int32_t* top,
   uint32_t* free_queue,
@@ -211,8 +211,12 @@ __global__ void sweep_kernel (
 
     if (threadIdx.x == 0) {
       s_n = *free_count;
-      s_old_top = 0;
-      if (s_n > 0) {
+      if (s_n == 0) {
+        s_old_top = 0;
+      }
+      else
+
+     {
         //reserve space in free_stack
         s_old_top = atomicAdd(top, static_cast<int32_t>(s_n));
         //reset free_count
@@ -235,7 +239,57 @@ __global__ void sweep_kernel (
   }
 
 
+  } old implementation skippy*/
+
+__global__ void sweep_kernel(
+    uint32_t* free_stack,
+    int32_t* top,
+    const uint32_t* free_queue,
+    uint32_t* free_count,
+    uint32_t num_blocks)
+{
+  __shared__ uint32_t s_n;
+  __shared__ int32_t s_old_top;
+
+  if (threadIdx.x == 0) {
+    // Snapshot how many frees are pending
+    s_n = *free_count;
+
+    if (s_n == 0) {
+      s_old_top = 0;
+    } else {
+      // Reserve exactly s_n slots in the free_stack
+      int32_t old = atomicAdd(top, (int32_t)s_n);
+      s_old_top = old;
+
+      // Hard bounds guard (v0 safety)
+      // If this triggers, your accounting is broken somewhere else.
+      if ((uint32_t)old + s_n > num_blocks) {
+        // Roll back the top to avoid corrupting memory.
+        atomicAdd(top, -(int32_t)s_n);
+        s_n = 0;
+      } else {
+        // Reset free_count (v0 assumes no concurrent enqueues during sweep)
+        *free_count = 0;
+      }
+    }
   }
+
+  __syncthreads();
+
+  const uint32_t n = s_n;
+  if (n == 0) return;
+
+  // Copy free_queue[0..n-1] back into free_stack[s_old_top .. s_old_top+n-1]
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t stride = blockDim.x * gridDim.x;
+
+  for (uint32_t i = tid; i < n; i += stride) {
+    free_stack[(uint32_t)s_old_top + i] = free_queue[i];
+  }
+}
+
+
 
 
 void init_system(AllocatorSystem& sys) {
